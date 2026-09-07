@@ -22,7 +22,10 @@ import numpy as np
 import pytesseract
 from PIL import Image, ImageDraw, ImageFont
 
+from tts_announcer import Announcer, SOUND_FAIL, SOUND_SUCCESS, format_duration, play_sound
+
 CAMERA_INDEX = "/dev/video3"  # L-12W。パスを直接指定（整数indexは内部列挙とズレることがある）
+ROOM_NAME = "自習室"  # 退室アナウンスで使う部屋名
 
 # パスはスクリプトの場所基準で一度だけ解決し、以後は全関数でこの解決済みパスを使う
 # （os.path.exists()とopen()で別の基準を使うと存在チェックがズレるバグの元になる）
@@ -42,21 +45,6 @@ ID_ROI_PADDING = 0           # id_roiの外側にさらに余白を足すピク�
 OCR_SAMPLES = 7              # OCR多数決に使うフレーム数
 
 FEEDBACK_SECONDS = 1.8       # 記録結果を画面に表示し続ける秒数
-SOUND_SUCCESS = "/usr/share/sounds/freedesktop/stereo/complete.oga"
-SOUND_FAIL = "/usr/share/sounds/freedesktop/stereo/dialog-error.oga"
-
-
-def play_sound(path):
-    """通知音を非同期再生。音声デバイスが無い/ファイルが無い環境でも落ちないようにする"""
-    import subprocess
-    try:
-        subprocess.Popen(
-            ["paplay", path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        pass  # paplayが無い環境では無音で継続
 
 
 _JP_FONT_CANDIDATES = [
@@ -106,11 +94,20 @@ def load_config():
 
 
 def load_roster():
-    roster = {}
+    """
+    roster.csv を読み込み、漢字名（画面表示・ログ用）とふりがな（音声用）を分けて返す。
+    furigana列が無い既存CSVは漢字名をそのまま音声用に使う（後方互換）。
+    """
+    roster = {}    # student_id -> 漢字名
+    readings = {}  # student_id -> ふりがな
     with open(ROSTER_PATH, encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            roster[row["student_id"].strip()] = row["name"].strip()
-    return roster
+            sid = row["student_id"].strip()
+            name = row["name"].strip()
+            roster[sid] = name
+            reading = row.get("furigana", "").strip()
+            readings[sid] = reading or name
+    return roster, readings
 
 
 def ensure_log_file():
@@ -120,15 +117,15 @@ def ensure_log_file():
             csv.writer(f).writerow(["timestamp", "student_id", "name", "event"])
 
 
-def get_last_status(student_id):
-    """CSVを末尾から見て、直近のイベントが in か out かを返す。記録が無ければ None"""
+def get_last_event(student_id):
+    """CSVを末尾から見て、student_idの直近のイベント行(dict)を返す。記録が無ければ None"""
     if not os.path.exists(LOG_PATH):
         return None
     last = None
     with open(LOG_PATH, encoding="utf-8") as f:
         for row in csv.DictReader(f):
             if row["student_id"] == student_id:
-                last = row["event"]
+                last = dict(row)
     return last
 
 
@@ -248,13 +245,14 @@ def capture_empty_base(cap, card_roi):
 
 def main():
     config = load_config()
-    roster = load_roster()
+    roster, readings = load_roster()
     ensure_log_file()
 
     card_roi = config["card_roi"]
     id_roi = config["id_roi"]
 
     cap = open_camera()
+    announcer = Announcer()  # kokoro初期化をバックグラウンドで開始（初回はモデルDLで時間がかかる）
 
     try:
         empty_base = capture_empty_base(cap, card_roi)  # 「何も置かれていない机」の基準フレーム
@@ -327,16 +325,32 @@ def main():
 
                     if student_id in roster:
                         name = roster[student_id]
-                        last_status = get_last_status(student_id)
-                        event = "out" if last_status == "in" else "in"
+                        last_event = get_last_event(student_id)
+                        event = "out" if last_event and last_event["event"] == "in" else "in"
                         append_log(student_id, name, event)
                         print(f"[記録] {student_id} {name} -> {event}")
 
-                        event_label = "入室" if event == "in" else "退室"
-                        feedback_text = f"{name} {event_label}"
-                        feedback_color = (0, 200, 0) if event == "in" else (0, 165, 255)
+                        if event == "in":
+                            feedback_text = f"{name} 入室"
+                            feedback_color = (0, 200, 0)
+                            play_sound(SOUND_SUCCESS)  # 即時ビープ
+                            announcer.speak(
+                                f"{readings[student_id]}さん、入室を確認しました。",
+                                fallback_sound=SOUND_SUCCESS,
+                            )
+                        else:
+                            dur_text = format_duration(
+                                (datetime.now() - datetime.fromisoformat(last_event["timestamp"]))
+                                .total_seconds()
+                            )
+                            feedback_text = f"{name} 退室"
+                            feedback_color = (0, 165, 255)
+                            play_sound(SOUND_SUCCESS)  # 即時ビープ
+                            announcer.speak(
+                                f"{readings[student_id]}さん、{ROOM_NAME}を{dur_text}利用しました。退室を確認しました。",
+                                fallback_sound=SOUND_SUCCESS,
+                            )
                         feedback_until = now + FEEDBACK_SECONDS
-                        play_sound(SOUND_SUCCESS)
                     else:
                         print(f"[未照合] OCR結果: '{student_id}' はroster.csvに一致なし。"
                               "一度カードをどけてから置き直してください（debug_id_crop.pngを確認）")
@@ -344,7 +358,9 @@ def main():
                         feedback_text = "認識できません。置き直してください"
                         feedback_color = (0, 0, 255)
                         feedback_until = now + FEEDBACK_SECONDS
-                        play_sound(SOUND_FAIL)
+                        play_sound(SOUND_FAIL)  # 即時エラー音
+                        announcer.speak("認識できませんでした。カードを置き直してください。",
+                                        fallback_sound=SOUND_FAIL)
 
                     # 結果に関わらず、カードが取り除かれるまでは再トリガーしない
                     remove_buffer.clear()
